@@ -9,9 +9,11 @@ const DIR = new URL('.', import.meta.url).pathname;
 const FIELD = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
 const WASM = DIR + 'circuits/gatekeeper.wasm', ZKEY = DIR + 'circuits/gatekeeper_final.zkey';
 const SECRET = () => process.env.AGENT_GAMES_HMAC_SECRET || '';
-const SEEN = DIR + 'seen.txt', LOG = DIR + 'tasks.jsonl';
-const seen = new Set(existsSync(SEEN) ? readFileSync(SEEN, 'utf8').split('\n').filter(Boolean) : []);
-const cache = new Map();  // task_id -> reply (platform retries = idempotent)
+const SEEN = DIR + 'seen.txt', LOG = DIR + 'tasks.jsonl', REPLIES = DIR + 'replies.jsonl';
+const lines = f => existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean) : [];
+const seen = new Map(lines(SEEN).map(l => l.split(' ')));  // proof_tx -> first task_id
+const cache = new Map();  // task_id -> reply promise; persisted so a retry after restart gets the same answer
+for (const l of lines(REPLIES)) { try { const { task_id, reply } = JSON.parse(l); cache.set(task_id, Promise.resolve(reply)); } catch {} }
 const vk = await snarkjs.zKey.exportVerificationKey(ZKEY);
 const NAMES = ['registeredVkHash', 'proofVkHash', 'minimum', 'publicBalance', 'expiryBlock', 'currentBlock',
   'recipient', 'conditionRecipient', 'amount', 'maxTransfer', 'decision', 'taskId'];
@@ -47,15 +49,16 @@ export async function prove(task, approve) {
 
 async function decide(task) {
   const i = task.input, ref = String(i.proof_tx).toLowerCase();
-  if (seen.has(ref)) return { decision: 'REJECT', reason_code: 'PROOF_REUSED', proof_tx: i.proof_tx };
-  seen.add(ref); appendFileSync(SEEN, ref + '\n');
+  if (seen.has(ref) && seen.get(ref) !== task.task_id) return { decision: 'REJECT', reason_code: 'PROOF_REUSED', proof_tx: i.proof_tx };
+  if (!seen.has(ref)) { seen.set(ref, task.task_id); appendFileSync(SEEN, ref + ' ' + task.task_id + '\n'); }
   const reason = policy(i), approve = reason === 'VALID_CONDITION';
-  try {
-    return { decision: approve ? 'APPROVE' : 'REJECT', reason_code: reason, proof_tx: i.proof_tx, ...await prove(task, approve) };
-  } catch (e) {  // fail closed: never APPROVE without a proof
-    log({ task_id: task.task_id, err: String(e.message || e) });
-    return { decision: 'REJECT', reason_code: approve ? 'PROOF_GENERATION_FAILED' : reason, proof_tx: i.proof_tx };
+  for (let k = 0; k < 3; k++) {
+    try {
+      return { decision: approve ? 'APPROVE' : 'REJECT', reason_code: reason, proof_tx: i.proof_tx, ...await prove(task, approve) };
+    } catch (e) { log({ task_id: task.task_id, try: k, err: String(e.message || e) }); }
   }
+  // fail closed: never APPROVE without a proof
+  return { decision: 'REJECT', reason_code: approve ? 'PROOF_GENERATION_FAILED' : reason, proof_tx: i.proof_tx };
 }
 
 async function handler(req, res) {
@@ -70,7 +73,8 @@ async function handler(req, res) {
   let m; try { m = JSON.parse(raw); } catch { return send(400, { error: 'bad json' }); }
   if (m.type === 'agent-games.preflight.v1') { log({ preflight: m.nonce }); return send(200, { ok: true, protocolVersion: 'v1' }); }
   if (m.type !== 'agent-games.proof-gatekeeper.v1' || !m.task_id || !m.input) { log({ unknown: m }); return send(400, { error: 'unknown type' }); }
-  if (!cache.has(m.task_id)) cache.set(m.task_id, decide(m));
+  if (!cache.has(m.task_id)) cache.set(m.task_id, decide(m).then(reply => {
+    appendFileSync(REPLIES, JSON.stringify({ task_id: m.task_id, reply }) + '\n'); return reply; }));
   const t0 = Date.now(), reply = await cache.get(m.task_id);
   log({ task_id: m.task_id, mode: m.mode, input: m.input, decision: reply.decision, reason: reply.reason_code, proved: !!reply.proof, ms: Date.now() - t0 });
   send(200, reply);
